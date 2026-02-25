@@ -1,44 +1,48 @@
 import { Router, Request, Response } from 'express';
 import crypto from 'crypto';
-import db from '../db.js';
+import pool from '../db.js';
 import { trainerOnly } from '../middleware/auth.js';
 
 const router = Router();
 
 // GET /api/tasks — get tasks for current user
-router.get('/', (req: Request, res: Response) => {
+router.get('/', async (req: Request, res: Response) => {
   try {
     const { userId, role } = req.user!;
 
     if (role === 'trainer') {
       // Trainer sees all tasks they created
-      const tasks = db.prepare(
-        'SELECT id, title, target_count as targetCount, type FROM tasks WHERE created_by = ? ORDER BY created_at DESC'
-      ).all(userId) as any[];
+      const { rows: tasks } = await pool.query(
+        'SELECT id, title, target_count as "targetCount", type FROM tasks WHERE created_by = $1 ORDER BY created_at DESC',
+        [userId]
+      );
 
-      const result = tasks.map((t) => {
-        const assignments = db.prepare(
-          `SELECT ta.trainee_id as traineeId, ta.progress, ta.completed, u.name
+      const result = [];
+      for (const t of tasks) {
+        const { rows: assignments } = await pool.query(
+          `SELECT ta.trainee_id as "traineeId", ta.progress, ta.completed, u.name
            FROM task_assignments ta
            JOIN users u ON u.id = ta.trainee_id
-           WHERE ta.task_id = ?`
-        ).all(t.id);
-        return { ...t, assignments };
-      });
+           WHERE ta.task_id = $1`,
+          [t.id]
+        );
+        result.push({ ...t, assignments });
+      }
 
       res.json(result);
     } else {
       // Trainee sees tasks assigned to them
-      const tasks = db.prepare(
-        `SELECT t.id, t.title, t.target_count as targetCount, t.type,
+      const { rows } = await pool.query(
+        `SELECT t.id, t.title, t.target_count as "targetCount", t.type,
                 ta.progress, ta.completed
          FROM tasks t
          JOIN task_assignments ta ON ta.task_id = t.id
-         WHERE ta.trainee_id = ?
-         ORDER BY t.created_at DESC`
-      ).all(userId);
+         WHERE ta.trainee_id = $1
+         ORDER BY t.created_at DESC`,
+        [userId]
+      );
 
-      res.json(tasks);
+      res.json(rows);
     }
   } catch (err) {
     console.error(err);
@@ -47,18 +51,19 @@ router.get('/', (req: Request, res: Response) => {
 });
 
 // GET /api/tasks/trainee/:traineeId — get a specific trainee's tasks
-router.get('/trainee/:traineeId', (req: Request, res: Response) => {
+router.get('/trainee/:traineeId', async (req: Request, res: Response) => {
   try {
-    const tasks = db.prepare(
-      `SELECT t.id, t.title, t.target_count as targetCount, t.type,
+    const { rows } = await pool.query(
+      `SELECT t.id, t.title, t.target_count as "targetCount", t.type,
               ta.progress, ta.completed
        FROM tasks t
        JOIN task_assignments ta ON ta.task_id = t.id
-       WHERE ta.trainee_id = ?
-       ORDER BY t.created_at DESC`
-    ).all(req.params.traineeId);
+       WHERE ta.trainee_id = $1
+       ORDER BY t.created_at DESC`,
+      [req.params.traineeId]
+    );
 
-    res.json(tasks);
+    res.json(rows);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Internal server error' });
@@ -66,7 +71,7 @@ router.get('/trainee/:traineeId', (req: Request, res: Response) => {
 });
 
 // POST /api/tasks — create task (trainer only)
-router.post('/', trainerOnly, (req: Request, res: Response) => {
+router.post('/', trainerOnly, async (req: Request, res: Response) => {
   try {
     const { title, targetCount, assignAll } = req.body;
     const trainerId = req.user!.userId;
@@ -77,21 +82,24 @@ router.post('/', trainerOnly, (req: Request, res: Response) => {
     }
 
     const taskId = crypto.randomUUID();
-    db.prepare(
-      'INSERT INTO tasks (id, title, target_count, type, created_by) VALUES (?, ?, ?, ?, ?)'
-    ).run(taskId, title, targetCount || 3, 'weekly', trainerId);
+    await pool.query(
+      'INSERT INTO tasks (id, title, target_count, type, created_by) VALUES ($1, $2, $3, $4, $5)',
+      [taskId, title, targetCount || 3, 'weekly', trainerId]
+    );
 
     // Assign to trainees
     if (assignAll) {
-      const trainees = db.prepare(
-        'SELECT id FROM users WHERE trainer_id = ? AND role = ?'
-      ).all(trainerId, 'trainee') as any[];
-
-      const insert = db.prepare(
-        'INSERT INTO task_assignments (task_id, trainee_id, progress, completed) VALUES (?, ?, 0, 0)'
+      const { rows: trainees } = await pool.query(
+        'SELECT id FROM users WHERE trainer_id = $1 AND role = $2',
+        [trainerId, 'trainee']
       );
 
-      trainees.forEach((t) => insert.run(taskId, t.id));
+      for (const t of trainees) {
+        await pool.query(
+          'INSERT INTO task_assignments (task_id, trainee_id, progress, completed) VALUES ($1, $2, 0, 0)',
+          [taskId, t.id]
+        );
+      }
     }
 
     res.status(201).json({ id: taskId, message: 'Task created' });
@@ -102,37 +110,43 @@ router.post('/', trainerOnly, (req: Request, res: Response) => {
 });
 
 // PUT /api/tasks/:taskId/progress — increment progress for current trainee
-router.put('/:taskId/progress', (req: Request, res: Response) => {
+router.put('/:taskId/progress', async (req: Request, res: Response) => {
   try {
     const traineeId = req.user!.userId;
     const taskId = req.params.taskId;
 
-    const assignment = db.prepare(
-      'SELECT * FROM task_assignments WHERE task_id = ? AND trainee_id = ?'
-    ).get(taskId, traineeId) as any;
+    const { rows: assignmentRows } = await pool.query(
+      'SELECT * FROM task_assignments WHERE task_id = $1 AND trainee_id = $2',
+      [taskId, traineeId]
+    );
 
-    if (!assignment) {
+    if (assignmentRows.length === 0) {
       res.status(404).json({ error: 'Task assignment not found' });
       return;
     }
 
-    const task = db.prepare('SELECT target_count FROM tasks WHERE id = ?').get(taskId) as any;
+    const assignment = assignmentRows[0];
+    const { rows: taskRows } = await pool.query('SELECT target_count FROM tasks WHERE id = $1', [taskId]);
+    const task = taskRows[0];
     const newProgress = assignment.progress + 1;
     const completed = newProgress >= task.target_count ? 1 : 0;
 
-    db.prepare(
-      'UPDATE task_assignments SET progress = ?, completed = ? WHERE task_id = ? AND trainee_id = ?'
-    ).run(newProgress, completed, taskId, traineeId);
+    await pool.query(
+      'UPDATE task_assignments SET progress = $1, completed = $2 WHERE task_id = $3 AND trainee_id = $4',
+      [newProgress, completed, taskId, traineeId]
+    );
 
     // If just completed, update streak
     if (completed && !assignment.completed) {
-      const streak = db.prepare('SELECT * FROM streaks WHERE trainee_id = ?').get(traineeId) as any;
-      if (streak) {
+      const { rows: streakRows } = await pool.query('SELECT * FROM streaks WHERE trainee_id = $1', [traineeId]);
+      if (streakRows.length > 0) {
+        const streak = streakRows[0];
         const newCurrent = streak.current_streak + 1;
         const newLongest = Math.max(streak.longest_streak, newCurrent);
-        db.prepare(
-          'UPDATE streaks SET current_streak = ?, longest_streak = ? WHERE trainee_id = ?'
-        ).run(newCurrent, newLongest, traineeId);
+        await pool.query(
+          'UPDATE streaks SET current_streak = $1, longest_streak = $2 WHERE trainee_id = $3',
+          [newCurrent, newLongest, traineeId]
+        );
       }
     }
 

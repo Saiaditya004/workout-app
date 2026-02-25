@@ -1,21 +1,23 @@
 import { Router, Request, Response } from 'express';
 import crypto from 'crypto';
-import db from '../db.js';
+import pool from '../db.js';
 
 const router = Router();
 
 // GET /api/workouts/:workoutId — get a single workout with exercises
-router.get('/:workoutId', (req: Request, res: Response) => {
+router.get('/:workoutId', async (req: Request, res: Response) => {
   try {
-    const workout = db.prepare('SELECT * FROM workouts WHERE id = ?').get(req.params.workoutId) as any;
-    if (!workout) {
+    const { rows: workoutRows } = await pool.query('SELECT * FROM workouts WHERE id = $1', [req.params.workoutId]);
+    if (workoutRows.length === 0) {
       res.status(404).json({ error: 'Workout not found' });
       return;
     }
 
-    const exercises = db.prepare(
-      'SELECT id, name, sets, target_reps as targetReps, target_weight as targetWeight FROM exercises WHERE workout_id = ? ORDER BY sort_order'
-    ).all(workout.id);
+    const workout = workoutRows[0];
+    const { rows: exercises } = await pool.query(
+      'SELECT id, name, sets, target_reps as "targetReps", target_weight as "targetWeight" FROM exercises WHERE workout_id = $1 ORDER BY sort_order',
+      [workout.id]
+    );
 
     res.json({ id: workout.id, name: workout.name, programId: workout.program_id, exercises });
   } catch (err) {
@@ -25,7 +27,7 @@ router.get('/:workoutId', (req: Request, res: Response) => {
 });
 
 // POST /api/workouts/log — log a completed workout
-router.post('/log', (req: Request, res: Response) => {
+router.post('/log', async (req: Request, res: Response) => {
   try {
     const { workoutId, exercisesLogged } = req.body;
     const traineeId = req.user!.userId;
@@ -36,22 +38,24 @@ router.post('/log', (req: Request, res: Response) => {
     }
 
     const logId = crypto.randomUUID();
-    db.prepare(
-      'INSERT INTO workout_logs (id, trainee_id, workout_id) VALUES (?, ?, ?)'
-    ).run(logId, traineeId, workoutId);
+    await pool.query(
+      'INSERT INTO workout_logs (id, trainee_id, workout_id) VALUES ($1, $2, $3)',
+      [logId, traineeId, workoutId]
+    );
 
     // Insert exercise logs
     if (Array.isArray(exercisesLogged)) {
-      const insertExLog = db.prepare(
-        'INSERT INTO exercise_logs (workout_log_id, exercise_id, set_index, reps, weight) VALUES (?, ?, ?, ?, ?)'
-      );
-      exercisesLogged.forEach((exLog: any) => {
+      for (const exLog of exercisesLogged) {
         if (Array.isArray(exLog.sets)) {
-          exLog.sets.forEach((s: any, idx: number) => {
-            insertExLog.run(logId, exLog.exerciseId, idx, s.reps || 0, s.weight || 0);
-          });
+          for (let idx = 0; idx < exLog.sets.length; idx++) {
+            const s = exLog.sets[idx];
+            await pool.query(
+              'INSERT INTO exercise_logs (workout_log_id, exercise_id, set_index, reps, weight) VALUES ($1, $2, $3, $4, $5)',
+              [logId, exLog.exerciseId, idx, s.reps || 0, s.weight || 0]
+            );
+          }
         }
-      });
+      }
     }
 
     res.status(201).json({ id: logId, message: 'Workout logged' });
@@ -62,18 +66,19 @@ router.post('/log', (req: Request, res: Response) => {
 });
 
 // GET /api/workouts/logs/:traineeId — get workout logs for a trainee
-router.get('/logs/:traineeId', (req: Request, res: Response) => {
+router.get('/logs/:traineeId', async (req: Request, res: Response) => {
   try {
-    const logs = db.prepare(
-      `SELECT wl.id, wl.trainee_id as traineeId, wl.workout_id as workoutId,
-              wl.completed_at as completedAt, w.name as workoutName
+    const { rows } = await pool.query(
+      `SELECT wl.id, wl.trainee_id as "traineeId", wl.workout_id as "workoutId",
+              wl.completed_at as "completedAt", w.name as "workoutName"
        FROM workout_logs wl
        LEFT JOIN workouts w ON w.id = wl.workout_id
-       WHERE wl.trainee_id = ?
-       ORDER BY wl.completed_at DESC`
-    ).all(req.params.traineeId);
+       WHERE wl.trainee_id = $1
+       ORDER BY wl.completed_at DESC`,
+      [req.params.traineeId]
+    );
 
-    res.json(logs);
+    res.json(rows);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Internal server error' });

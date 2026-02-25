@@ -1,15 +1,15 @@
 import { Router, Request, Response } from 'express';
 import bcrypt from 'bcryptjs';
 import crypto from 'crypto';
-import db from '../db.js';
+import pool from '../db.js';
 import { signToken, verifyToken } from '../middleware/auth.js';
 
 const router = Router();
 
 // POST /api/auth/register
-router.post('/register', (req: Request, res: Response) => {
+router.post('/register', async (req: Request, res: Response) => {
   try {
-    const { email, password, name, role, trainerId } = req.body;
+    const { email, password, name, role } = req.body;
 
     if (!email || !password || !name || !role) {
       res.status(400).json({ error: 'email, password, name, and role are required' });
@@ -22,8 +22,8 @@ router.post('/register', (req: Request, res: Response) => {
     }
 
     // Check duplicate email
-    const existing = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
-    if (existing) {
+    const { rows: existingRows } = await pool.query('SELECT id FROM users WHERE email = $1', [email.toLowerCase()]);
+    if (existingRows.length > 0) {
       res.status(409).json({ error: 'Email already registered' });
       return;
     }
@@ -45,23 +45,25 @@ router.post('/register', (req: Request, res: Response) => {
         res.status(400).json({ error: 'Invite code is required for trainees' });
         return;
       }
-      const trainer = db.prepare(
-        'SELECT id FROM users WHERE invite_code = ? AND role = ?'
-      ).get(code.toUpperCase(), 'trainer') as any;
-      if (!trainer) {
+      const { rows: trainerRows } = await pool.query(
+        'SELECT id FROM users WHERE invite_code = $1 AND role = $2',
+        [code.toUpperCase(), 'trainer']
+      );
+      if (trainerRows.length === 0) {
         res.status(400).json({ error: 'Invalid invite code' });
         return;
       }
-      resolvedTrainerId = trainer.id;
+      resolvedTrainerId = trainerRows[0].id;
     }
 
-    db.prepare(
-      'INSERT INTO users (id, email, password, name, role, trainer_id, invite_code) VALUES (?, ?, ?, ?, ?, ?, ?)'
-    ).run(id, email.toLowerCase(), hashedPassword, name, role, resolvedTrainerId, inviteCode);
+    await pool.query(
+      'INSERT INTO users (id, email, password, name, role, trainer_id, invite_code) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+      [id, email.toLowerCase(), hashedPassword, name, role, resolvedTrainerId, inviteCode]
+    );
 
     // Create streak record for trainees
     if (role === 'trainee') {
-      db.prepare('INSERT INTO streaks (trainee_id, current_streak, longest_streak) VALUES (?, 0, 0)').run(id);
+      await pool.query('INSERT INTO streaks (trainee_id, current_streak, longest_streak) VALUES ($1, 0, 0)', [id]);
     }
 
     const token = signToken({ userId: id, role });
@@ -75,7 +77,7 @@ router.post('/register', (req: Request, res: Response) => {
 });
 
 // POST /api/auth/login
-router.post('/login', (req: Request, res: Response) => {
+router.post('/login', async (req: Request, res: Response) => {
   try {
     const { email, password } = req.body;
 
@@ -84,15 +86,17 @@ router.post('/login', (req: Request, res: Response) => {
       return;
     }
 
-    const user = db.prepare(
-      'SELECT id, email, password, name, role, trainer_id as trainerId, invite_code as inviteCode FROM users WHERE email = ?'
-    ).get(email.toLowerCase()) as any;
+    const { rows } = await pool.query(
+      'SELECT id, email, password, name, role, trainer_id as "trainerId", invite_code as "inviteCode" FROM users WHERE email = $1',
+      [email.toLowerCase()]
+    );
 
-    if (!user) {
+    if (rows.length === 0) {
       res.status(401).json({ error: 'Invalid email or password' });
       return;
     }
 
+    const user = rows[0];
     const valid = bcrypt.compareSync(password, user.password);
     if (!valid) {
       res.status(401).json({ error: 'Invalid email or password' });
@@ -110,8 +114,7 @@ router.post('/login', (req: Request, res: Response) => {
 });
 
 // GET /api/auth/me
-router.get('/me', (req: Request, res: Response) => {
-  // This is called with auth middleware from the main router
+router.get('/me', async (req: Request, res: Response) => {
   const header = req.headers.authorization;
   if (!header?.startsWith('Bearer ')) {
     res.status(401).json({ error: 'Not authenticated' });
@@ -121,16 +124,17 @@ router.get('/me', (req: Request, res: Response) => {
   try {
     const payload = verifyToken(header.slice(7));
 
-    const user = db.prepare(
-      'SELECT id, email, name, role, trainer_id as trainerId, invite_code as inviteCode FROM users WHERE id = ?'
-    ).get(payload.userId);
+    const { rows } = await pool.query(
+      'SELECT id, email, name, role, trainer_id as "trainerId", invite_code as "inviteCode" FROM users WHERE id = $1',
+      [payload.userId]
+    );
 
-    if (!user) {
+    if (rows.length === 0) {
       res.status(404).json({ error: 'User not found' });
       return;
     }
 
-    res.json({ user });
+    res.json({ user: rows[0] });
   } catch {
     res.status(401).json({ error: 'Invalid token' });
   }
