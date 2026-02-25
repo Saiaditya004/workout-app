@@ -3,8 +3,18 @@ import dns from 'dns';
 import dotenv from 'dotenv';
 dotenv.config();
 
-// Force IPv4 to avoid ENETUNREACH on platforms like Render
+// Force ALL DNS lookups to IPv4 — Render cannot reach Supabase over IPv6
 dns.setDefaultResultOrder('ipv4first');
+const origLookup = dns.lookup.bind(dns);
+(dns as any).lookup = (hostname: string, options: any, cb: any) => {
+  if (typeof options === 'function') {
+    cb = options;
+    options = { family: 4 };
+  } else {
+    options = { ...options, family: 4 };
+  }
+  return origLookup(hostname, options, cb);
+};
 
 const { Pool } = pg;
 
