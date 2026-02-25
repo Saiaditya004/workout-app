@@ -23,33 +23,29 @@ const allowedOrigins = process.env.CORS_ORIGIN
 app.use(cors({ origin: allowedOrigins, credentials: true }));
 app.use(express.json());
 
-// Init database and start server
-(async () => {
+// Public routes
+app.use('/api/auth', authRoutes);
+
+// Protected routes
+app.use('/api/users', authMiddleware, userRoutes);
+app.use('/api/programs', authMiddleware, programRoutes);
+app.use('/api/workouts', authMiddleware, workoutRoutes);
+app.use('/api/tasks', authMiddleware, taskRoutes);
+app.use('/api/leaderboard', authMiddleware, leaderboardRoutes);
+
+// Health check
+app.get('/api/health', (_req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+// Bind port FIRST so Render detects it, then init DB
+app.listen(PORT, async () => {
+  console.log(`\nFitCoach API running on port ${PORT}`);
+  console.log(`   Health check: /api/health\n`);
   try {
     await initDb();
     console.log('Database initialized successfully');
   } catch (err) {
     console.error('Failed to initialize database:', err);
-    process.exit(1);
   }
-
-  // Public routes
-  app.use('/api/auth', authRoutes);
-
-  // Protected routes
-  app.use('/api/users', authMiddleware, userRoutes);
-  app.use('/api/programs', authMiddleware, programRoutes);
-  app.use('/api/workouts', authMiddleware, workoutRoutes);
-  app.use('/api/tasks', authMiddleware, taskRoutes);
-  app.use('/api/leaderboard', authMiddleware, leaderboardRoutes);
-
-  // Health check
-  app.get('/api/health', (_req, res) => {
-    res.json({ status: 'ok', timestamp: new Date().toISOString() });
-  });
-
-  app.listen(PORT, () => {
-    console.log(`\nFitCoach API running on port ${PORT}`);
-    console.log(`   Health check: /api/health\n`);
-  });
-})();
+});
